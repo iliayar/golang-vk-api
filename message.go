@@ -105,34 +105,22 @@ type AudioAttachment struct {
 	Performer string `json:"performer"`
 }
 
-type VideoAttachment struct {
-	ID            int    `json:"id"`
-	OwnerID       int    `json:"owner_id"`
-	Title         string `json:"title"`
-	Duration      int    `json:"duration"`
-	Description   string `json:"description"`
-	Date          int64  `json:"date"`
-	AddingDate    int64  `json:"adding_date"`
-	Views         int    `json:"views"`
-	Width         int    `json:"width"`
-	Height        int    `json:"height"`
-	Photo130      string `json:"photo130"`
-	Photo320      string `json:"photo320"`
-	Photo800      string `json:"photo800"`
-	FirstFrame320 string `json:"first_frame_320"`
-	FirstFrame160 string `json:"first_frame_160"`
-	FirstFrame130 string `json:"first_frame_130"`
-	FirstFrame800 string `json:"first_frame_800"`
-	Player        string `json:"player"`
-	CanEdit       int    `json:"can_edit"`
-	CanAdd        int    `json:"can_add"`
-}
-
 type LinkAttachment struct {
 	URL         string `json:"url"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Target      string `json:"target"`
+}
+
+type Keyboard struct {
+	OneTime 	bool		`json:"one_time"`
+	Buttons		[][]Button 	`json:"buttons"`
+	Inline		bool 		`json:"inline"`
+}
+
+type Button struct {
+	Action		map[string]string	`json:"action"`
+	Color		string				`json:"color"`
 }
 
 func (client *VKClient) DialogsGet(count int, params url.Values) (*Dialog, error) {
@@ -178,7 +166,7 @@ func (client *VKClient) MessagesGet(count int, chatID int, isDialog bool, params
 		chatID += 2000000000
 	}
 
-	params.Add("user_id",strconv.Itoa(chatID))
+	params.Add("user_id", strconv.Itoa(chatID))
 	params.Add("count", strconv.Itoa(count))
 
 	resp, err := client.MakeRequest("messages.getHistory", params)
@@ -210,17 +198,17 @@ func (client *VKClient) MessagesGetByID(message_ids []int, params url.Values) (i
 	return message.Count, message.Messages, nil
 }
 
-func (client *VKClient) MessagesSend(user interface{}, message string, params url.Values) (APIResponse, error) {
+func (client *VKClient) MessagesSend(peerOrDomain interface{}, message string, params url.Values) (APIResponse, error) {
 	if params == nil {
 		params = url.Values{}
 	}
 	params.Add("message", message)
 
-	switch user.(type) {
+	switch peerOrDomain.(type) {
 	case int:
-		params.Add("user_id", strconv.Itoa(user.(int)))
+		params.Add("peer_id", strconv.Itoa(peerOrDomain.(int)))
 	case string:
-		params.Add("domain", user.(string))
+		params.Add("domain", peerOrDomain.(string))
 	}
 
 	resp, err := client.MakeRequest("messages.send", params)

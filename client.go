@@ -5,15 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
 const (
-	tokenURL = "https://oauth.vk.com/token"
-	apiURL   = "https://api.vk.com/method/%s"
+	tokenURL   = "https://oauth.vk.com/token"
+	apiURL     = "https://api.vk.com/method/%s"
+	apiVersion = "5.103"
 )
 
 const (
@@ -23,8 +26,10 @@ const (
 )
 
 type ratelimiter struct {
-	requestsCount   int
-	lastRequestTime time.Time
+	MaxRequestsPerSecond int
+	requestsCount        int
+	lastRequestTime      time.Time
+	mux                  sync.Mutex
 }
 
 type VKClient struct {
@@ -34,23 +39,45 @@ type VKClient struct {
 	cb     *callbackHandler
 }
 
-type TokenOptions struct {
-	ServiceToken    bool
-	ValidateOnStart bool
+type VKGroupBot struct {
+	VKClient
+	Group
+	cb *botsCallBackHandler
 }
 
-func newVKClientBlank() *VKClient {
+type TokenOptions struct {
+	ServiceToken      bool
+	ValidateOnStart   bool
+	TokenLanguage     string
+	RequestsPerSecond int
+}
+
+func newVKClientBlank(limitrate bool) *VKClient {
+	var netTransport = &http.Transport{
+		Dial: (&net.Dialer{
+			Timeout: 5 * time.Second,
+		}).Dial,
+		TLSHandshakeTimeout: 5 * time.Second,
+	}
+	var netClient = &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: netTransport,
+	}
+	var rl *ratelimiter = nil
+	if limitrate {
+		rl = &ratelimiter{}
+	}
 	return &VKClient{
-		Client: &http.Client{},
-		rl:     &ratelimiter{},
+		Client: netClient,
+		rl:     rl,
 		cb: &callbackHandler{
 			events: make(map[string]func(*LongPollMessage)),
 		},
 	}
 }
 
-func NewVKClient(device int, user string, password string) (*VKClient, error) {
-	vkclient := newVKClientBlank()
+func NewVKClient(device int, user string, password string, limitrate bool) (*VKClient, error) {
+	vkclient := newVKClientBlank(limitrate)
 
 	token, err := vkclient.auth(device, user, password)
 	if err != nil {
@@ -62,27 +89,56 @@ func NewVKClient(device int, user string, password string) (*VKClient, error) {
 	return vkclient, nil
 }
 
-func NewVKClientWithToken(token string, options *TokenOptions) (*VKClient, error) {
-	vkclient := newVKClientBlank()
+func NewVKClientWithToken(token string, options *TokenOptions, limitrate bool) (*VKClient, error) {
+	vkclient := newVKClientBlank(limitrate)
 	vkclient.Self.AccessToken = token
+	if options == nil {
+		return vkclient, nil
+	}
 
-	if options != nil {
-		if options.ValidateOnStart {
-			uid, err := vkclient.requestSelfID()
-			if err != nil {
+	vkclient.Self.Lang = options.TokenLanguage
+
+	if options.ValidateOnStart {
+		uid, err := vkclient.requestSelfID()
+		if err != nil {
+			return nil, err
+		}
+		vkclient.Self.UID = uid
+
+		if !options.ServiceToken {
+			if err := vkclient.updateSelfUser(); err != nil {
 				return nil, err
-			}
-			vkclient.Self.UID = uid
-
-			if !options.ServiceToken {
-				if err := vkclient.updateSelfUser(); err != nil {
-					return nil, err
-				}
 			}
 		}
 	}
 
+	if options.RequestsPerSecond > 0 && limitrate {
+		vkclient.rl.MaxRequestsPerSecond = options.RequestsPerSecond
+	}
+
 	return vkclient, nil
+}
+
+func NewVKGroupBot(token string, options *TokenOptions, limitrate bool) (*VKGroupBot, error) {
+	vkclient, err := NewVKClientWithToken(token, options, limitrate)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := vkclient.MakeRequest("groups.getById", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var res []*Group
+	json.Unmarshal(resp.Response, &res)
+	return &VKGroupBot{
+		VKClient: *vkclient,
+		Group:    *res[0],
+		cb: &botsCallBackHandler{
+			events: make(map[string]func(*BotsLongPollObject)),
+		},
+	}, nil
 }
 
 func (client *VKClient) updateSelfUser() error {
@@ -101,7 +157,13 @@ func (client *VKClient) updateSelfUser() error {
 }
 
 func (s *ratelimiter) Wait() {
-	if s.requestsCount == 3 {
+	if s == nil {
+		return
+	}
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if s.requestsCount >= s.MaxRequestsPerSecond {
 		secs := time.Since(s.lastRequestTime).Seconds()
 		ms := int((1 - secs) * 1000)
 		if ms > 0 {
@@ -116,6 +178,11 @@ func (s *ratelimiter) Wait() {
 }
 
 func (s *ratelimiter) Update() {
+	if s == nil {
+		return
+	}
+	s.mux.Lock()
+	defer s.mux.Unlock()
 	s.requestsCount++
 	s.lastRequestTime = time.Now()
 }
@@ -212,7 +279,10 @@ func (client *VKClient) MakeRequest(method string, params url.Values) (APIRespon
 	}
 
 	params.Set("access_token", client.Self.AccessToken)
-	params.Set("v", "5.71")
+	params.Set("v", apiVersion)
+	if client.Self.Lang != "" {
+		params.Set("lang", client.Self.Lang)
+	}
 
 	resp, err := client.Client.PostForm(endpoint, params)
 	if err != nil {
@@ -234,4 +304,12 @@ func (client *VKClient) MakeRequest(method string, params url.Values) (APIRespon
 		return apiresp, errors.New("Error code: " + strconv.Itoa(apiresp.ResponseError.ErrorCode) + ", " + apiresp.ResponseError.ErrorMsg)
 	}
 	return apiresp, nil
+}
+
+func (c *VKClient) SetCustomHTTPClient(client *http.Client) {
+	c.Client = client
+}
+
+func (c *VKGroupBot) SetCustomHTTPClient(client *http.Client) {
+	c.Client = client
 }
